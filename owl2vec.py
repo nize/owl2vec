@@ -7,6 +7,7 @@
 
 import os
 import uuid
+from datetime import datetime
 from openai import OpenAI
 from qdrant_client import QdrantClient, models
 from SPARQLWrapper import SPARQLWrapper, JSON
@@ -50,39 +51,91 @@ def get_graph_data(endpoint_url):
     """
     print("Querying GraphDB to retrieve data...")
     sparql = SPARQLWrapper(endpoint_url)
-    # This query retrieves classes and various textual annotations.
-    # It groups results by URI to concatenate multiple synonyms and explanatory notes.
+    # This query retrieves classes and all their annotation properties and built-in properties,
+    # excluding specific properties that are not relevant for embeddings.
     sparql.setQuery("""
         PREFIX owl: <http://www.w3.org/2002/07/owl#>
         PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
-        PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+        PREFIX dct: <http://purl.org/dc/terms/>
         PREFIX cmns-av: <https://www.omg.org/spec/Commons/AnnotationVocabulary/>
+        PREFIX sm: <http://www.omg.org/techprocess/ab/SpecificationMetadata/>
 
-        SELECT ?uri 
-               (SAMPLE(?label) as ?sampleLabel)
-               (SAMPLE(?prefLabel) as ?samplePrefLabel)
-               (SAMPLE(?definition) as ?sampleDefinition)
-               (SAMPLE(?example) as ?sampleExample)
-               (GROUP_CONCAT(DISTINCT ?synonym; SEPARATOR=" | ") as ?synonyms)
-               (GROUP_CONCAT(DISTINCT ?explanatoryNote; SEPARATOR=" | ") as ?explanatoryNotes)
+        SELECT ?uri ?property ?value
         WHERE {
           ?uri a owl:Class .
           FILTER(isIRI(?uri))
           
-          OPTIONAL { ?uri rdfs:label ?label . }
-          OPTIONAL { ?uri skos:prefLabel ?prefLabel . }
-          OPTIONAL { ?uri skos:definition ?definition . }
-          OPTIONAL { ?uri skos:example ?example . }
-          OPTIONAL { ?uri cmns-av:synonym ?synonym . }
-          OPTIONAL { ?uri cmns-av:explanatoryNote ?explanatoryNote . }
+          ?uri ?property ?value .
+          
+          # Include annotation properties OR built-in properties
+          {
+            ?property a owl:AnnotationProperty .
+          }
+          UNION
+          {
+            FILTER(?property IN (
+              rdfs:label,
+              rdfs:comment,
+              rdfs:seeAlso,
+              rdfs:isDefinedBy,
+              owl:versionInfo
+            ))
+          }
+          
+          # Exclude specific properties
+          FILTER(?property NOT IN (
+            dct:issued,
+            dct:license,
+            dct:modified,
+            cmns-av:copyright,
+            dct:rights,
+            sm:directSource,
+            owl:minQualifiedCardinality,
+            dct:source,
+            owl:versionInfo
+          ))
+          
+          # Only include literal values (text)
+          FILTER(isLiteral(?value))
         }
-        GROUP BY ?uri
     """)
     sparql.setReturnFormat(JSON)
     try:
         results = sparql.query().convert()
-        print(f"Successfully retrieved {len(results['results']['bindings'])} entities from GraphDB.")
-        return results["results"]["bindings"]
+        print(f"Successfully retrieved {len(results['results']['bindings'])} property-value pairs from GraphDB.")
+        
+        # Group the results by URI
+        grouped_data = {}
+        for binding in results['results']['bindings']:
+            uri = binding.get("uri", {}).get("value")
+            property_uri = binding.get("property", {}).get("value")
+            value = binding.get("value", {}).get("value")
+            
+            if not uri or not property_uri or not value:
+                continue
+                
+            if uri not in grouped_data:
+                grouped_data[uri] = {}
+                
+            # Extract the property name from the URI (everything after the last # or /)
+            property_name = property_uri.split('#')[-1] if '#' in property_uri else property_uri.split('/')[-1]
+            
+            if property_name not in grouped_data[uri]:
+                grouped_data[uri][property_name] = []
+                
+            grouped_data[uri][property_name].append(value)
+        
+        # Convert grouped data back to the expected format
+        processed_data = []
+        for uri, properties in grouped_data.items():
+            processed_data.append({
+                "uri": {"value": uri},
+                "properties": properties
+            })
+            
+        print(f"Processed into {len(processed_data)} unique entities.")
+        return processed_data
+        
     except Exception as e:
         print(f"Error querying GraphDB: {e}")
         return []
@@ -105,39 +158,69 @@ def create_embeddings(text, client):
 def index_data(data, qdrant_client, openai_client):
     """
     Generates embeddings and indexes the data into Qdrant.
+    Only creates new embeddings if the text content has changed.
     """
     print(f"Indexing data into Qdrant collection '{QDRANT_COLLECTION_NAME}'...")
+    
+    # Get existing points to check for changes
+    print("Checking existing points for changes...")
+    existing_points = {}
+    try:
+        # Retrieve all existing points (in batches if needed)
+        scroll_result = qdrant_client.scroll(
+            collection_name=QDRANT_COLLECTION_NAME,
+            limit=10000,  # Adjust based on your collection size
+            with_payload=True,
+            with_vectors=False  # We don't need the vectors, just the payload
+        )
+        for point in scroll_result[0]:
+            if point.payload and 'uri' in point.payload:
+                existing_points[point.payload['uri']] = point.payload.get('text', '')
+        
+        print(f"Found {len(existing_points)} existing points.")
+    except Exception as e:
+        print(f"Warning: Could not retrieve existing points: {e}")
+        print("Proceeding without change detection...")
+    
     points_to_upsert = []
+    skipped_count = 0
+    updated_count = 0
+    
     for item in tqdm(data, desc="Processing entities"):
         uri = item.get("uri", {}).get("value")
         if not uri:
             continue
 
-        # Extract data from the query results
-        label = item.get("sampleLabel", {}).get("value", "")
-        pref_label = item.get("samplePrefLabel", {}).get("value", "")
-        definition = item.get("sampleDefinition", {}).get("value", "")
-        example = item.get("sampleExample", {}).get("value", "")
-        synonyms = item.get("synonyms", {}).get("value", "")
-        explanatory_notes = item.get("explanatoryNotes", {}).get("value", "")
+        # Extract all properties
+        properties = item.get("properties", {})
         
-        # We create a single, rich text entry for embedding
-        text_to_embed = (
-            f"Label: {label}\n"
-            f"Preferred Label: {pref_label}\n"
-            f"Definition: {definition}\n"
-            f"Synonyms: {synonyms}\n"
-            f"Explanatory Notes: {explanatory_notes}\n"
-            f"Example: {example}"
-        ).strip()
+        # Build the text to embed from all properties
+        text_parts = []
+        for property_name, values in properties.items():
+            if values:  # Only include if there are values
+                # Join multiple values with " | " separator
+                combined_values = " | ".join(values)
+                # Make property names stand out with brackets and uppercase
+                text_parts.append(f"[{property_name.upper()}]: {combined_values}")
+        
+        text_to_embed = "\n".join(text_parts).strip()
         
         if not text_to_embed:
             continue
 
-        # Create embedding for the text
+        # Check if text has changed compared to existing point
+        existing_text = existing_points.get(uri, None)
+        if existing_text == text_to_embed:
+            skipped_count += 1
+            continue  # Skip if text hasn't changed
+        
+        # Create embedding for the text (only if changed or new)
         vector = create_embeddings(text_to_embed, openai_client)
 
         if vector:
+            # Add current timestamp
+            current_time = datetime.now().isoformat()
+            
             points_to_upsert.append(
                 models.PointStruct(
                     id=str(uuid.uuid5(uuid.NAMESPACE_URL, uri)),
@@ -145,15 +228,11 @@ def index_data(data, qdrant_client, openai_client):
                     payload={
                         "uri": uri,
                         "text": text_to_embed,
-                        "label": label,
-                        "pref_label": pref_label,
-                        "definition": definition,
-                        "synonyms": synonyms,
-                        "explanatory_notes": explanatory_notes,
-                        "example": example,
+                        "last_updated": current_time,
                     }
                 )
             )
+            updated_count += 1
         
         # Upsert in batches to avoid overwhelming the server
         if len(points_to_upsert) >= 100:
@@ -172,7 +251,7 @@ def index_data(data, qdrant_client, openai_client):
             wait=True
         )
 
-    print("Data indexing complete.")
+    print(f"Data indexing complete. Updated: {updated_count}, Skipped (unchanged): {skipped_count}")
 
 
 if __name__ == "__main__":
