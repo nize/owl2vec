@@ -24,7 +24,7 @@ GRAPHDB_ENDPOINT = "http://localhost:7200/repositories/kg-llm"
 
 # Qdrant configuration
 QDRANT_URL = "http://localhost:6333"
-QDRANT_COLLECTION_NAME = "fibo_knowledge_graph"
+QDRANT_COLLECTION_NAME = "acme_knowledge_graph"
 
 # OpenAI configuration
 # Make sure you have the OPENAI_API_KEY environment variable set
@@ -41,7 +41,7 @@ EMBEDDING_DIMENSIONS = {
 VECTOR_SIZE = EMBEDDING_DIMENSIONS.get(OPENAI_EMBEDDING_MODEL)
 
 # Set to None to index all items, or an integer to limit the number of items for testing.
-MAX_ITEMS_TO_INDEX = 10 # or None to index everything
+MAX_ITEMS_TO_INDEX = 20 # or None to index everything
 
 # --- Main Script ---
 
@@ -61,6 +61,8 @@ def get_graph_data(endpoint_url):
         PREFIX sm: <http://www.omg.org/techprocess/ab/SpecificationMetadata/>
 
         SELECT ?uri ?property ?value ?entityType
+        FROM <http://acme.com/graph/fibo-ontology>
+        FROM <http://acme.com/graph/acme-ontology>
         WHERE {
           # Match entities of different types
           {
@@ -119,6 +121,9 @@ def get_graph_data(endpoint_url):
           FILTER(isLiteral(?value))
         }
     """)
+    
+    # Disable inference to avoid duplicated content from reasoner
+    sparql.addParameter("infer", "false")
     sparql.setReturnFormat(JSON)
     try:
         results = sparql.query().convert()
