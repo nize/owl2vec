@@ -110,7 +110,7 @@ def get_graph_data(endpoint_url):
             dct:license,
             dct:modified,
             cmns-av:copyright,
-            cmns-av:adaptedFrom
+            cmns-av:adaptedFrom,
             dct:rights,
             sm:directSource,
             owl:minQualifiedCardinality,
