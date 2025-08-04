@@ -104,12 +104,13 @@ def get_graph_data(endpoint_url):
             ))
           }
           
-          # Exclude specific properties
+          # Exclude specific properties (not adding direct meaning)
           FILTER(?property NOT IN (
             dct:issued,
             dct:license,
             dct:modified,
             cmns-av:copyright,
+            cmns-av:adaptedFrom
             dct:rights,
             sm:directSource,
             owl:minQualifiedCardinality,
