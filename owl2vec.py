@@ -41,7 +41,7 @@ EMBEDDING_DIMENSIONS = {
 VECTOR_SIZE = EMBEDDING_DIMENSIONS.get(OPENAI_EMBEDDING_MODEL)
 
 # Set to None to index all items, or an integer to limit the number of items for testing.
-MAX_ITEMS_TO_INDEX = 100 # or None to index everything
+MAX_ITEMS_TO_INDEX = 10 # or None to index everything
 
 # --- Main Script ---
 
@@ -60,9 +60,29 @@ def get_graph_data(endpoint_url):
         PREFIX cmns-av: <https://www.omg.org/spec/Commons/AnnotationVocabulary/>
         PREFIX sm: <http://www.omg.org/techprocess/ab/SpecificationMetadata/>
 
-        SELECT ?uri ?property ?value
+        SELECT ?uri ?property ?value ?entityType
         WHERE {
-          ?uri a owl:Class .
+          # Match entities of different types
+          {
+            ?uri a owl:Class .
+            BIND("Class" AS ?entityType)
+          }
+          UNION
+          {
+            ?uri a owl:NamedIndividual .
+            BIND("NamedIndividual" AS ?entityType)
+          }
+          UNION
+          {
+            ?uri a owl:ObjectProperty .
+            BIND("ObjectProperty" AS ?entityType)
+          }
+          UNION
+          {
+            ?uri a owl:DatatypeProperty .
+            BIND("DatatypeProperty" AS ?entityType)
+          }
+          
           FILTER(isIRI(?uri))
           
           ?uri ?property ?value .
@@ -110,27 +130,35 @@ def get_graph_data(endpoint_url):
             uri = binding.get("uri", {}).get("value")
             property_uri = binding.get("property", {}).get("value")
             value = binding.get("value", {}).get("value")
+            entity_type = binding.get("entityType", {}).get("value")
             
-            if not uri or not property_uri or not value:
+            if not uri or not property_uri or not value or not entity_type:
                 continue
                 
             if uri not in grouped_data:
-                grouped_data[uri] = {}
+                grouped_data[uri] = {
+                    "properties": {},
+                    "entity_types": set()
+                }
+                
+            # Track entity types (using set to handle punning automatically)
+            grouped_data[uri]["entity_types"].add(entity_type)
                 
             # Extract the property name from the URI (everything after the last # or /)
             property_name = property_uri.split('#')[-1] if '#' in property_uri else property_uri.split('/')[-1]
             
-            if property_name not in grouped_data[uri]:
-                grouped_data[uri][property_name] = []
+            if property_name not in grouped_data[uri]["properties"]:
+                grouped_data[uri]["properties"][property_name] = []
                 
-            grouped_data[uri][property_name].append(value)
+            grouped_data[uri]["properties"][property_name].append(value)
         
         # Convert grouped data back to the expected format
         processed_data = []
-        for uri, properties in grouped_data.items():
+        for uri, data in grouped_data.items():
             processed_data.append({
                 "uri": {"value": uri},
-                "properties": properties
+                "properties": data["properties"],
+                "entity_types": list(data["entity_types"])  # Convert set to list
             })
             
         print(f"Processed into {len(processed_data)} unique entities.")
@@ -191,8 +219,9 @@ def index_data(data, qdrant_client, openai_client):
         if not uri:
             continue
 
-        # Extract all properties
+        # Extract all properties and entity types
         properties = item.get("properties", {})
+        entity_types = item.get("entity_types", [])
         
         # Build the text to embed from all properties
         text_parts = []
@@ -228,6 +257,7 @@ def index_data(data, qdrant_client, openai_client):
                     payload={
                         "uri": uri,
                         "text": text_to_embed,
+                        "entity_type": entity_types,
                         "last_updated": current_time,
                     }
                 )
