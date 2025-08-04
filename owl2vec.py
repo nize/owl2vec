@@ -153,16 +153,21 @@ def get_graph_data(endpoint_url):
             property_name = property_uri.split('#')[-1] if '#' in property_uri else property_uri.split('/')[-1]
             
             if property_name not in grouped_data[uri]["properties"]:
-                grouped_data[uri]["properties"][property_name] = []
+                grouped_data[uri]["properties"][property_name] = set()  # Use set to avoid duplicates
                 
-            grouped_data[uri]["properties"][property_name].append(value)
+            grouped_data[uri]["properties"][property_name].add(value)
         
         # Convert grouped data back to the expected format
         processed_data = []
         for uri, data in grouped_data.items():
+            # Convert sets to lists for properties, removing duplicates
+            properties_dict = {}
+            for prop_name, value_set in data["properties"].items():
+                properties_dict[prop_name] = list(value_set)  # Convert set to list
+            
             processed_data.append({
                 "uri": {"value": uri},
-                "properties": data["properties"],
+                "properties": properties_dict,
                 "entity_types": list(data["entity_types"])  # Convert set to list
             })
             
