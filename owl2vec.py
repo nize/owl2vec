@@ -41,7 +41,10 @@ EMBEDDING_DIMENSIONS = {
 VECTOR_SIZE = EMBEDDING_DIMENSIONS.get(OPENAI_EMBEDDING_MODEL)
 
 # Set to None to index all items, or an integer to limit the number of items for testing.
-MAX_ITEMS_TO_INDEX = 20 # or None to index everything
+MAX_ITEMS_TO_INDEX = None # or None to index everything
+
+# Set to True to delete points from Qdrant that no longer exist in GraphDB
+CLEANUP_DELETED_ENTITIES = True
 
 # --- Main Script ---
 
@@ -194,6 +197,62 @@ def create_embeddings(text, client):
         return None
 
 
+def cleanup_deleted_entities(graph_data, qdrant_client):
+    """
+    Removes points from Qdrant that no longer exist in the GraphDB data.
+    """
+    if not CLEANUP_DELETED_ENTITIES:
+        print("Cleanup of deleted entities is disabled.")
+        return
+        
+    print("Checking for entities to cleanup...")
+    
+    # Get all URIs from current GraphDB data
+    current_uris = set()
+    for item in graph_data:
+        uri = item.get("uri", {}).get("value")
+        if uri:
+            current_uris.add(uri)
+    
+    print(f"Found {len(current_uris)} entities in current GraphDB data.")
+    
+    # Get all existing points from Qdrant
+    existing_point_ids = []
+    existing_uris = set()
+    
+    try:
+        scroll_result = qdrant_client.scroll(
+            collection_name=QDRANT_COLLECTION_NAME,
+            limit=100000,  # Adjust based on your collection size
+            with_payload=True,
+            with_vectors=False
+        )
+        
+        for point in scroll_result[0]:
+            if point.payload and 'uri' in point.payload:
+                uri = point.payload['uri']
+                existing_uris.add(uri)
+                if uri not in current_uris:
+                    # This URI no longer exists in GraphDB, mark for deletion
+                    existing_point_ids.append(point.id)
+        
+        print(f"Found {len(existing_uris)} entities in Qdrant index.")
+        
+        if existing_point_ids:
+            print(f"Deleting {len(existing_point_ids)} points that no longer exist in GraphDB...")
+            qdrant_client.delete(
+                collection_name=QDRANT_COLLECTION_NAME,
+                points_selector=models.PointIdsList(points=existing_point_ids),
+                wait=True
+            )
+            print(f"Successfully deleted {len(existing_point_ids)} obsolete points.")
+        else:
+            print("No obsolete points found to delete.")
+            
+    except Exception as e:
+        print(f"Error during cleanup: {e}")
+
+
 def index_data(data, qdrant_client, openai_client):
     """
     Generates embeddings and indexes the data into Qdrant.
@@ -334,6 +393,9 @@ if __name__ == "__main__":
         if MAX_ITEMS_TO_INDEX is not None and isinstance(MAX_ITEMS_TO_INDEX, int):
             print(f"Limiting indexing to the first {MAX_ITEMS_TO_INDEX} items.")
             graph_data = graph_data[:MAX_ITEMS_TO_INDEX]
+        
+        # Clean up entities that no longer exist in GraphDB (before indexing)
+        cleanup_deleted_entities(graph_data, qdrant_client)
             
         # Index the data
         index_data(graph_data, qdrant_client, openai_client)
