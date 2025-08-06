@@ -221,22 +221,38 @@ def cleanup_deleted_entities(graph_data, qdrant_client):
     existing_uris = set()
     
     try:
-        scroll_result = qdrant_client.scroll(
-            collection_name=QDRANT_COLLECTION_NAME,
-            limit=100000,  # Adjust based on your collection size
-            with_payload=True,
-            with_vectors=False
-        )
+        offset = None
+        batch_size = 1000  # Smaller batches for more reliable scrolling
+        total_retrieved = 0
         
-        for point in scroll_result[0]:
-            if point.payload and 'uri' in point.payload:
-                uri = point.payload['uri']
-                existing_uris.add(uri)
-                if uri not in current_uris:
-                    # This URI no longer exists in GraphDB, mark for deletion
-                    existing_point_ids.append(point.id)
+        while True:
+            scroll_result = qdrant_client.scroll(
+                collection_name=QDRANT_COLLECTION_NAME,
+                limit=batch_size,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False
+            )
+            
+            points, next_offset = scroll_result
+            
+            for point in points:
+                if point.payload and 'uri' in point.payload:
+                    uri = point.payload['uri']
+                    existing_uris.add(uri)
+                    if uri not in current_uris:
+                        # This URI no longer exists in GraphDB, mark for deletion
+                        existing_point_ids.append(point.id)
+            
+            total_retrieved += len(points)
+            
+            # If we got fewer points than requested or no next_offset, we're done
+            if len(points) < batch_size or next_offset is None:
+                break
+                
+            offset = next_offset
         
-        print(f"Found {len(existing_uris)} entities in Qdrant index.")
+        print(f"Found {len(existing_uris)} entities in Qdrant index (retrieved {total_retrieved} total points).")
         
         if existing_point_ids:
             print(f"Deleting {len(existing_point_ids)} points that no longer exist in GraphDB...")
@@ -264,18 +280,35 @@ def index_data(data, qdrant_client, openai_client):
     print("Checking existing points for changes...")
     existing_points = {}
     try:
-        # Retrieve all existing points (in batches if needed)
-        scroll_result = qdrant_client.scroll(
-            collection_name=QDRANT_COLLECTION_NAME,
-            limit=10000,  # Adjust based on your collection size
-            with_payload=True,
-            with_vectors=False  # We don't need the vectors, just the payload
-        )
-        for point in scroll_result[0]:
-            if point.payload and 'uri' in point.payload:
-                existing_points[point.payload['uri']] = point.payload.get('text', '')
+        # Retrieve all existing points using proper scrolling
+        offset = None
+        batch_size = 1000  # Smaller batches for more reliable scrolling
+        total_retrieved = 0
         
-        print(f"Found {len(existing_points)} existing points.")
+        while True:
+            scroll_result = qdrant_client.scroll(
+                collection_name=QDRANT_COLLECTION_NAME,
+                limit=batch_size,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False  # We don't need the vectors, just the payload
+            )
+            
+            points, next_offset = scroll_result
+            
+            for point in points:
+                if point.payload and 'uri' in point.payload:
+                    existing_points[point.payload['uri']] = point.payload.get('text', '')
+            
+            total_retrieved += len(points)
+            
+            # If we got fewer points than requested or no next_offset, we're done
+            if len(points) < batch_size or next_offset is None:
+                break
+                
+            offset = next_offset
+        
+        print(f"Found {len(existing_points)} existing points (retrieved {total_retrieved} total).")
     except Exception as e:
         print(f"Warning: Could not retrieve existing points: {e}")
         print("Proceeding without change detection...")
